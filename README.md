@@ -1,4 +1,3 @@
-# Azure Kubernetes Fleet Manager Update Runner
 
 ## Prerequisites
 
@@ -61,16 +60,16 @@ For each location, find the oldest available Kubernetes version, create resource
 ```
 for ((i=0; i<${#LOCATIONS[@]}; i++)); do
   # create resource group
-  az group create -n "rg-$RAND-$((i+1))" -l "${LOCATIONS[$i]}"
+  az group create --name "rg-$RAND-$((i+1))" --location "${LOCATIONS[$i]}"
   
   # get k8s minor version
-  K8S_MINOR_VERSION=$(az aks get-versions -l "${LOCATIONS[$i]}" --query "values[?contains(capabilities.supportPlan[], 'KubernetesOfficial')].version | sort(@) | [0]" --output tsv)
+  K8S_MINOR_VERSION=$(az aks get-versions --location "${LOCATIONS[$i]}" --query "values[?contains(capabilities.supportPlan[], 'KubernetesOfficial')].version | sort(@) | [0]" --output tsv)
   
   # get k8s patch version
-  K8S_PATCH_VERSION=$(az aks get-versions -l "${LOCATIONS[$i]}" -o json | jq -r --arg ver "$K8S_MINOR_VERSION" '.values[] | select(.version == $ver) | .patchVersions | keys[0]')
+  K8S_PATCH_VERSION=$(az aks get-versions --location "${LOCATIONS[$i]}" --output json | jq -r --arg ver "$K8S_MINOR_VERSION" '.values[] | select(.version == $ver) | .patchVersions | keys[0]')
   
   # create aks cluster
-  AKS_ID=$(az aks create -n "aks-$RAND-$((i+1))" -g "rg-$RAND-$((i+1))" --node-count 1 --kubernetes-version "$K8S_PATCH_VERSION" --node-vm-size standard_b2ms --query id -o tsv)
+  AKS_ID=$(az aks create -n "aks-$RAND-$((i+1))" --resource-group "rg-$RAND-$((i+1))" --node-count 1 --kubernetes-version "$K8S_PATCH_VERSION" --node-vm-size standard_b2ms --query id --output tsv)
   
   # add aks cluster to fleet
   az fleet member create --resource-group "$RG_NAME" --fleet-name "$FLEET_NAME" --name "aks-$RAND-$((i+1))" --member-cluster-id "$AKS_ID"
@@ -103,31 +102,31 @@ GITHUB_REPO=$(gh api user --jq .login)/akfm-${RAND}
 Create new private repo
 
 ```
-gh repo create $GITHUB_REPO --template pauldotyu/akfm-updaterunner --private --clone
+gh repo create $GITHUB_REPO --template pauldotyu/akfm-update-runner --private --clone
 cd $REPO_NAME
 ```
 
 Set subscription and tenant variables
 
 ```
-SUBSCRIPTION_ID=$(az account show --query id -o tsv)
-TENANT_ID=$(az account show --query tenantId -o tsv)
+SUBSCRIPTION_ID=$(az account show --query id --output tsv)
+TENANT_ID=$(az account show --query tenantId --output tsv)
 ```
 
 Create a service principal and assign Contributor role to subscription scope
 
 ```
-APP_ID=$(az ad sp create-for-rbac -n sp-$RAND --role Contributor --scopes "/subscriptions/${SUBSCRIPTION_ID}" --create-password false --query appId -o tsv)
+APP_ID=$(az ad sp create-for-rbac --name sp-$RAND --role Contributor --scopes "/subscriptions/${SUBSCRIPTION_ID}" --create-password false --query appId --output tsv)
 ```
 
 Create a federated credential
 
 ```
 az ad app federated-credential create \
-  --id "$APP_ID" \
+  --id $APP_ID \
   --parameters "$(cat <<EOF
 {
-    "name": "$APP_ID",
+    "name": "${REPO_NAME}",
     "issuer": "https://token.actions.githubusercontent.com",
     "subject": "repo:${GITHUB_REPO}:ref:refs/heads/main",
     "audiences": [
@@ -152,13 +151,28 @@ Set repo variables
 gh variable set FLEET_NAME --body $FLEET_NAME --repo $GITHUB_REPO
 gh variable set FLEET_RESOURCE_GROUP --body $RG_NAME --repo $GITHUB_REPO
 ```
+
+## Test manual run
+
+Manually initiate an update run
+
+```
+gh workflow run manual-update.yml -f resource_group=$RG_NAME -f fleet_name=$FLEET_NAME
+```
+
+Watch the update run
+
+```
+gh run watch $(gh run list --workflow="manual-update.yml" --json databaseId --jq '.[0].databaseId')
+```
+
 ## Cleanup
 
 ```
-az group delete -n rg-$RAND-1 -y --no-wait
-az group delete -n rg-$RAND-2 -y --no-wait
-az group delete -n rg-$RAND-3 -y --no-wait
-az group delete -n rg-$RAND-fleet -y --no-wait
-az ad sp delete -n sp-$RAND -y --no-wait
-gh repo delete akfm-$RAND
+az group delete --name rg-$RAND-1 -y --no-wait
+az group delete --name rg-$RAND-2 -y --no-wait
+az group delete --name rg-$RAND-3 -y --no-wait
+az group delete --name rg-$RAND-fleet -y --no-wait
+az ad sp delete --id $APP_ID
+gh repo delete $GITHUB_REPO
 ```
