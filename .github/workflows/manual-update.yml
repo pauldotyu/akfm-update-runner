@@ -1,0 +1,305 @@
+name: Kubernetes fleet manager - Manual Update Run
+on:
+  workflow_dispatch:
+    inputs:
+      resource_group:
+        description: Azure resource group
+        required: true
+      fleet_name:
+        description: Fleet resource name
+        required: true
+      kubernetes_version:
+        description: Target AKS version
+        required: false
+      upgrade_type:
+        description: Fleet upgrade type
+        required: true
+        default: Full
+        type: choice
+        options:
+          - Full
+          - ControlPlaneOnly
+          - NodeImageOnly
+      node_image_selection:
+        description: Node image selection policy
+        required: true
+        default: Latest
+        type: choice
+        options:
+          - Latest
+          - Consistent
+  workflow_call:
+    inputs:
+      resource_group:
+        description: Azure resource group
+        required: true
+        type: string
+      fleet_name:
+        description: Fleet resource name
+        required: true
+        type: string
+      kubernetes_version:
+        description: Target AKS version
+        required: false
+        type: string
+      upgrade_type:
+        description: Fleet upgrade type
+        required: true
+        type: string
+      node_image_selection:
+        description: Node image selection policy
+        required: true
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  update-run:
+    runs-on: ubuntu-latest
+    env:
+      RESOURCE_GROUP: ${{ inputs.resource_group || github.event.inputs.resource_group }}
+      FLEET_NAME: ${{ inputs.fleet_name || github.event.inputs.fleet_name }}
+      KUBERNETES_VERSION: ${{ inputs.kubernetes_version || github.event.inputs.kubernetes_version }}
+      UPGRADE_TYPE: ${{ inputs.upgrade_type || github.event.inputs.upgrade_type }}
+      NODE_IMAGE_SELECTION: ${{ inputs.node_image_selection || github.event.inputs.node_image_selection }}
+      UPDATERUN_NAME: ${{ github.run_id }}
+    steps:
+      - name: Azure login
+        uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2.3.0
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      
+      - name: Install Azure CLI extensions
+        uses: azure/cli@9f7ce6f37c31b777ec6c6b6d1dfe7db79f497956 # v2.2.0
+        with:
+          azcliversion: latest
+          inlineScript: |
+            set -euo pipefail
+            IFS=$'\n\t'
+            az extension add --name aks-preview
+            az extension add --name fleet
+
+      - name: Find lowest common Kubernetes version
+        id: find-lowest-k8s-version
+        if: ${{ env.KUBERNETES_VERSION == '' && env.UPGRADE_TYPE != 'NodeImageOnly' }}
+        uses: azure/cli@9f7ce6f37c31b777ec6c6b6d1dfe7db79f497956 # v2.2.0
+        with:
+          azcliversion: latest
+          inlineScript: |
+            set -euo pipefail
+            IFS=$'\n\t'
+
+            upgrade_versions=()
+            current_versions=()
+            upgrade_outputs=()
+
+            # Get all cluster IDs in the fleet
+            readarray -t clusters < <(az fleet member list -g "$RESOURCE_GROUP" -f "$FLEET_NAME" --query "[].clusterResourceId" -o tsv --only-show-errors 2>/dev/null)
+
+            if (( ${#clusters[@]} == 0 )); then
+              echo "No fleet members found for $FLEET_NAME in $RESOURCE_GROUP."
+              exit 1
+            fi
+
+            echo "Found ${#clusters[@]} fleet member(s)."
+
+            # Collect current versions and upgrade lists for each cluster
+            for cluster_id in "${clusters[@]}"; do
+              # Get RG and AKS name
+              resource_info=$(az resource show --ids "$cluster_id" --query "{resourceGroup:resourceGroup,name:name}" -o tsv --only-show-errors)
+              RG_NAME=$(echo "$resource_info" | cut -f1)
+              AKS_NAME=$(echo "$resource_info" | cut -f2)
+
+              # Current control plane version
+              current_version=$(az aks show -g "$RG_NAME" -n "$AKS_NAME" --query kubernetesVersion -o tsv --only-show-errors 2>/dev/null)
+              current_versions+=("$current_version")
+
+              # Available upgrades for this cluster
+              upgrade_output=$(az aks get-upgrades -g "$RG_NAME" -n "$AKS_NAME" --query controlPlaneProfile.upgrades --only-show-errors 2>/dev/null)
+              if [[ -n "$upgrade_output" && "$upgrade_output" != "null" ]]; then
+                upgrade_outputs+=("$(echo "$upgrade_output" | jq -r '.[].kubernetesVersion' | jq -R . | jq -s .)")
+              else
+                upgrade_outputs+=("[]")
+              fi
+            done
+
+
+            # Build a single list of upgrade versions using the upgrade_outputs
+            for idx in "${!upgrade_outputs[@]}"; do
+              upgrade_versions+=("${upgrade_outputs[idx]}")
+            done
+
+
+            count=${#upgrade_versions[*]}
+
+            if (( count > 0 )); then
+              common_versions=()
+              seeded=false
+
+              # Compute intersection of available upgrades, ignoring clusters with no upgrades
+              for (( idx=0; idx<count; idx++ )); do
+                readarray -t cluster_upgrade_versions < <(jq -r '.[]' <<< "${upgrade_versions[idx]}")
+
+                # Skip clusters with no available upgrades
+                if (( ${#cluster_upgrade_versions[*]} == 0 )); then
+                  echo "Skipping cluster index $idx (no available upgrades)."
+                  continue
+                fi
+
+                if [[ "$seeded" == false ]]; then
+                  common_versions=("${cluster_upgrade_versions[@]}")
+                  seeded=true
+                  continue
+                fi
+
+                tmp=()
+                for cv in "${common_versions[@]}"; do
+                  for curr in "${cluster_upgrade_versions[@]}"; do
+                    if [[ "$cv" == "$curr" ]]; then
+                      tmp+=("$cv")
+                      break
+                    fi
+                  done
+                done
+                common_versions=("${tmp[@]}")
+
+                if (( ${#common_versions[*]} == 0 )); then
+                  break
+                fi
+              done
+
+              if [[ "$seeded" == false ]]; then
+                echo "No clusters reported any available upgrades."
+                exit 0
+              fi
+
+              if (( ${#common_versions[*]} == 0 )); then
+                echo "No common upgrade version found across clusters with available upgrades."
+                exit 0
+              fi
+
+              # Sort versions properly and get the lowest common version
+              lowest_common_version=$(printf '%s\n' "${common_versions[@]}" | sort -V | head -n1)
+            else
+              echo "No upgrade data gathered; ensure fleet members are ready."
+            fi
+
+            echo "KUBERNETES_VERSION=$lowest_common_version" >> "$GITHUB_ENV"
+            echo "Set KUBERNETES_VERSION=$lowest_common_version"
+
+      - name: Determine whether to run update
+        id: should_run
+        run: |
+          if [[ -n "$KUBERNETES_VERSION" || "$UPGRADE_TYPE" == "NodeImageOnly" ]]; then
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create update run
+        if: ${{ steps.should_run.outputs.should_run == 'true' }}
+        uses: azure/cli@9f7ce6f37c31b777ec6c6b6d1dfe7db79f497956 # v2.2.0
+        with:
+          azcliversion: latest
+          inlineScript: |
+            set -euo pipefail
+            IFS=$'\n\t'
+
+            if [[ "$UPGRADE_TYPE" != "NodeImageOnly" && -z "$KUBERNETES_VERSION" ]]; then
+              echo "kubernetes_version input required when upgrade type is $UPGRADE_TYPE"
+              exit 1
+            fi
+            if [[ "$UPGRADE_TYPE" == "NodeImageOnly" ]]; then
+              az fleet updaterun create \
+                -g $RESOURCE_GROUP \
+                -f $FLEET_NAME \
+                -n $UPDATERUN_NAME \
+                --upgrade-type $UPGRADE_TYPE \
+                --node-image-selection $NODE_IMAGE_SELECTION \
+                --only-show-errors
+            else
+              az fleet updaterun create \
+                -g $RESOURCE_GROUP \
+                -f $FLEET_NAME \
+                -n $UPDATERUN_NAME \
+                --upgrade-type $UPGRADE_TYPE \
+                --kubernetes-version $KUBERNETES_VERSION \
+                --node-image-selection $NODE_IMAGE_SELECTION \
+                --only-show-errors
+            fi
+      
+      - name: Start the update run
+        if: ${{ steps.should_run.outputs.should_run == 'true' }}
+        uses: azure/cli@9f7ce6f37c31b777ec6c6b6d1dfe7db79f497956 # v2.2.0
+        with:
+          azcliversion: latest
+          inlineScript: |
+            set -euo pipefail
+            IFS=$'\n\t'
+            az fleet updaterun start \
+            -g $RESOURCE_GROUP \
+            -f $FLEET_NAME \
+            -n $UPDATERUN_NAME \
+            --only-show-errors
+
+      - name: Wait for update run
+        if: ${{ steps.should_run.outputs.should_run == 'true' }}
+        uses: azure/cli@9f7ce6f37c31b777ec6c6b6d1dfe7db79f497956 # v2.2.0
+        with:
+          azcliversion: latest
+          inlineScript: |
+            set -euo pipefail
+            IFS=$'\n\t'
+            az fleet updaterun wait \
+            -g $RESOURCE_GROUP \
+            -f $FLEET_NAME \
+            --update-run-name $UPDATERUN_NAME \
+            --custom "status.status.state!='Running'" \
+            --only-show-errors
+
+      - name: Get update run status
+        if: ${{ steps.should_run.outputs.should_run == 'true' }}
+        id: get-update-run-status
+        uses: azure/cli@9f7ce6f37c31b777ec6c6b6d1dfe7db79f497956 # v2.2.0
+        with:
+          azcliversion: latest
+          inlineScript: |
+            set -euo pipefail
+            IFS=$'\n\t'
+            echo "state=$(az fleet updaterun show \
+              -g $RESOURCE_GROUP \
+              -f $FLEET_NAME \
+              -n $UPDATERUN_NAME \
+              --query status.status.state \
+              -o tsv \
+              --only-show-errors)" >> "$GITHUB_OUTPUT"
+
+      - name: Fail if update run failed
+        if: ${{ steps.should_run.outputs.should_run == 'true' && steps.get-update-run-status.outputs.state == 'Failed' }}
+        env:
+          STATUS: ${{ steps.get-update-run-status.outputs.state }}
+        uses: azure/cli@9f7ce6f37c31b777ec6c6b6d1dfe7db79f497956 # v2.2.0
+        with:
+          azcliversion: latest
+          inlineScript: |
+            set -euo pipefail
+            IFS=$'\n\t'
+            echo "Update run failed with status: $STATUS"
+            echo "$(az fleet updaterun show \
+              -g $RESOURCE_GROUP \
+              -f $FLEET_NAME \
+              -n $UPDATERUN_NAME \
+              --query '{code:status.status.error.code,message:status.status.error.message}' \
+              --only-show-errors)" 
+            exit 1
+
+      - name: Succeed if update run not failed
+        if: ${{ steps.should_run.outputs.should_run == 'true' && steps.get-update-run-status.outputs.state != 'Failed' }}
+        env:
+          STATUS: ${{ steps.get-update-run-status.outputs.state }}
+        run: |
+          echo "Update run completed with status: $STATUS."

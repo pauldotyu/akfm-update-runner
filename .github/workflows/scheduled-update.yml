@@ -1,0 +1,19 @@
+name: Kubernetes fleet manager - Scheduled Update Run
+on:
+  schedule:
+    - cron: "0 * * * *"
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  update-run:
+    uses: ./.github/workflows/manual-update.yml
+    with:
+      resource_group: ${{ vars.FLEET_RESOURCE_GROUP }}
+      fleet_name: ${{ vars.FLEET_NAME }}
+      kubernetes_version: ""
+      upgrade_type: "Full"
+      node_image_selection: "Latest"
+    secrets: inherit
