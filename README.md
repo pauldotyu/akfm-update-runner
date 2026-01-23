@@ -175,7 +175,7 @@ TENANT_ID=$(az account show --query tenantId --output tsv)
 Create a service principal with Contributor access at subscription scope for GitHub Actions.
 
 ```bash
-APP_ID=$(az ad sp create-for-rbac --name sp-$RAND --role Contributor --scopes "/subscriptions/${SUBSCRIPTION_ID}" --create-password false --query appId --output tsv)
+CLIENT_ID=$(az ad sp create-for-rbac --name sp-$RAND --role Contributor --scopes "/subscriptions/${SUBSCRIPTION_ID}" --create-password false --query appId --output tsv)
 ```
 
 ### Create federated credential
@@ -184,7 +184,7 @@ Allow GitHub Actions to authenticate to Azure using workload identity federation
 
 ```bash
 az ad app federated-credential create \
-  --id $APP_ID \
+  --id $CLIENT_ID \
   --parameters "$(cat <<EOF
 {
     "name": "${REPO_NAME}",
@@ -203,7 +203,7 @@ EOF
 Store Azure identity values as GitHub Secrets for the workflows.
 
 ```bash
-gh secret set AZURE_CLIENT_ID --body $APP_ID --repo $GITHUB_REPO
+gh secret set AZURE_CLIENT_ID --body $CLIENT_ID --repo $GITHUB_REPO
 gh secret set AZURE_SUBSCRIPTION_ID --body $SUBSCRIPTION_ID --repo $GITHUB_REPO
 gh secret set AZURE_TENANT_ID --body $TENANT_ID --repo $GITHUB_REPO
 ```
@@ -262,6 +262,6 @@ az group delete --name rg-$RAND-1 -y --no-wait
 az group delete --name rg-$RAND-2 -y --no-wait
 az group delete --name rg-$RAND-3 -y --no-wait
 az group delete --name rg-$RAND-fleet -y --no-wait
-az ad sp delete --id $APP_ID
+az ad sp delete --id $CLIENT_ID
 gh repo delete $GITHUB_REPO
 ```
