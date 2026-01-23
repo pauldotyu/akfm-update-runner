@@ -246,6 +246,7 @@ gh run watch $(gh run list --workflow="manual-update.yml" --json databaseId --jq
 - `az fleet` or `az aks` commands fail: confirm `aks-preview` and `fleet` extensions are installed.
 - `K8S_MINOR_VERSION` or `K8S_PATCH_VERSION` is empty: check region support and output of `az aks get-versions`.
 - GitHub Actions auth fails: confirm `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, and `AZURE_SUBSCRIPTION_ID` are set and the federated credential `subject` matches the repo/branch.
+- Workflow run times out: GitHub-hosted runners can execute for up to 6 hours. If execution take longer than 6 hours, look to run the workflow on [self-hosted runners](https://docs.github.com/en/actions/concepts/runners/self-hosted-runners). Also see [GitHub Action limits](https://docs.github.com/actions/reference/limits) for more info.
 
 ## Costs
 
